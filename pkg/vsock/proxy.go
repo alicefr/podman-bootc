@@ -1,4 +1,4 @@
-package proxy
+package vsock
 
 import (
 	"context"
@@ -11,8 +11,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const podmanVMProxyDefault = "/tmp/podman-bootc-proxy.sock"
-
 type Proxy struct {
 	cid    uint
 	port   uint
@@ -21,9 +19,6 @@ type Proxy struct {
 }
 
 func NewProxy(cid, port uint, socket string) *Proxy {
-	if socket == "" {
-		socket = podmanVMProxyDefault
-	}
 	return &Proxy{
 		cid:    cid,
 		port:   port,
