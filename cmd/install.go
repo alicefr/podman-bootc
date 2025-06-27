@@ -9,26 +9,20 @@ import (
 	"github.com/containers/podman-bootc/pkg/podman"
 	"github.com/containers/podman-bootc/pkg/vm"
 	"github.com/containers/podman-bootc/pkg/vm/domain"
-	proxy "github.com/containers/podman-bootc/pkg/vsock"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/spf13/cobra"
-)
-
-const (
-	// TODO: change the image tag with a proper version
-	defaultImage = "quay.io/containers/bootc-vm:latest"
-	diskName     = "disk.img"
-	podmanSocket = "/run/user/1000/podman/podman.sock"
+	log "github.com/sirupsen/logrus"
 )
 
 type installCmd struct {
 	image            string
-	vmImage          string
 	bootcCmdLine     []string
 	artifactsDir     string
 	diskPath         string
 	ctx              context.Context
 	socket           string
+	podmanSocketDir  string
+	libvirtDir       string
 	outputImage      string
 	containerStorage string
 	configPath       string
@@ -64,7 +58,6 @@ func NewInstallCommand() *cobra.Command {
 		cacheDir = ""
 	}
 	cacheDir = filepath.Join(cacheDir, "bootc")
-	cmd.PersistentFlags().StringVar(&c.vmImage, "bootc-vm", defaultImage, "bootc-vm container image containing the VM disk image")
 	cmd.PersistentFlags().StringVar(&c.image, "bootc-image", "", "bootc-vm container image")
 	cmd.PersistentFlags().StringVar(&c.artifactsDir, "dir", cacheDir, "directory where the artifacts are extracted")
 	cmd.PersistentFlags().StringVar(&c.outputPath, "output-dir", "", "directory to store the output results")
@@ -75,7 +68,6 @@ func NewInstallCommand() *cobra.Command {
 	if args, err := filterCmdlineArgs(os.Args); err == nil {
 		c.bootcCmdLine = args
 	}
-	c.diskPath = filepath.Join(c.artifactsDir, diskName)
 
 	return cmd
 }
@@ -94,11 +86,6 @@ func (c *installCmd) validateArgs() error {
 	if c.outputImage == "" {
 		return fmt.Errorf("the output-image needs to be set")
 	}
-	absPath, err := filepath.Abs(c.outputImage)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path for the output image: %v", err)
-	}
-	c.outputImage = absPath
 	if c.outputPath == "" {
 		return fmt.Errorf("the output-path needs to be set")
 	}
@@ -114,6 +101,7 @@ func (c *installCmd) validateArgs() error {
 	if len(c.bootcCmdLine) == 0 {
 		return fmt.Errorf("the bootc commandline needs to be specified after the '--'")
 	}
+	var err error
 	c.ctx, err = bindings.NewConnection(context.Background(), "unix://"+c.socket)
 	if err != nil {
 		return fmt.Errorf("failed to connect to podman at %s: %v", c.socket, err)
@@ -122,25 +110,18 @@ func (c *installCmd) validateArgs() error {
 	return nil
 }
 
-func (c *installCmd) installBuildVM() error {
-	inputPath := filepath.Join(c.artifactsDir, "disk.img")
-	inputImageFormat, err := domain.GetDiskInfo(inputPath)
+func (c *installCmd) installBuildVM(kernel, initrd string) error {
+	image := filepath.Join(c.outputPath, c.outputImage)
+	outputImageFormat, err := domain.GetDiskInfo(image)
 	if err != nil {
 		return err
 	}
-	outputImageFormat, err := domain.GetDiskInfo(c.outputImage)
-	if err != nil {
-		return err
-	}
-	c.installVM = vm.NewInstallVM(vm.InstallOptions{
-		DiskImage:            inputPath,
-		OutputImage:          c.outputImage,
-		InputFormat:          inputImageFormat,
-		OutputFormat:         outputImageFormat,
-		ContainerStoragePath: c.containerStorage,
-		ConfigPath:           c.configPath,
-		OutputPath:           c.outputPath,
-		Root:                 false,
+	c.installVM = vm.NewInstallVM(filepath.Join(c.libvirtDir, "virtqemud-sock"), vm.InstallOptions{
+		OutputFormat: outputImageFormat,
+		OutputImage:  filepath.Join(vm.OutputDir, c.outputImage), // Path relative to the container filesystem
+		Root:         false,
+		Kernel:       kernel,
+		Initrd:       initrd,
 	})
 	if err := c.installVM.Run(); err != nil {
 		return err
@@ -153,22 +134,43 @@ func (c *installCmd) doInstall(_ *cobra.Command, _ []string) error {
 	if err := c.validateArgs(); err != nil {
 		return err
 	}
-
-	if err := podman.ExtractDiskImage(c.socket, c.artifactsDir, c.vmImage); err != nil {
+	c.libvirtDir = filepath.Join(c.artifactsDir, "libvirt")
+	if _, err := os.Stat(c.libvirtDir); os.IsNotExist(err) {
+		if err := os.Mkdir(c.libvirtDir, 0755); err != nil {
+			return err
+		}
+	}
+	c.podmanSocketDir = filepath.Join(c.artifactsDir, "podman")
+	if _, err := os.Stat(c.podmanSocketDir); os.IsNotExist(err) {
+		if err := os.Mkdir(c.podmanSocketDir, 0755); err != nil {
+			return err
+		}
+	}
+	remoteSocket := filepath.Join(c.podmanSocketDir, "podman-vm.sock")
+	vmCont := podman.NewVMContainer(c.image, c.socket, &podman.RunVMContainerOptions{
+		ContainerStoragePath: c.containerStorage,
+		ConfigDir:            c.configPath,
+		OutputDir:            c.outputPath,
+		SocketDir:            c.podmanSocketDir,
+		LibvirtSocketDir:     c.libvirtDir,
+	})
+	if err := vmCont.Run(); err != nil {
 		return err
 	}
-	if err := c.installBuildVM(); err != nil {
+	defer vmCont.Stop()
+
+	kernel, initrd, err := vmCont.GetBootArtifacts()
+	if err != nil {
+		return err
+	}
+	log.Debugf("Boot artifacts kernel: %s and initrd: %s", kernel, initrd)
+
+	if err := c.installBuildVM(kernel, initrd); err != nil {
 		return err
 	}
 	defer c.installVM.Stop()
 
-	p := proxy.NewProxy(vm.CIDInstallVM, vm.VSOCKPort, filepath.Join(c.artifactsDir, "bootcvm.sock"))
-	if err := p.Start(); err != nil {
-		return err
-	}
-	defer p.Stop()
-
-	if err := podman.RunPodmanCmd(p.GetSocket(), c.image, c.bootcCmdLine); err != nil {
+	if err := podman.RunPodmanCmd(remoteSocket, c.image, c.bootcCmdLine); err != nil {
 		return err
 	}
 

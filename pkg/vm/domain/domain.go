@@ -92,7 +92,7 @@ func allocateDevices(d *libvirtxml.Domain) {
 	}
 }
 
-func WithFilesystem(source, target string) DomainOption {
+func WithFilesystem(source, target, vfsdBin string) DomainOption {
 	return func(d *libvirtxml.Domain) {
 		allocateDevices(d)
 		d.Devices.Filesystems = append(d.Devices.Filesystems, libvirtxml.DomainFilesystem{
@@ -106,6 +106,9 @@ func WithFilesystem(source, target string) DomainOption {
 			},
 			Target: &libvirtxml.DomainFilesystemTarget{
 				Dir: target,
+			},
+			Binary: &libvirtxml.DomainFilesystemBinary{
+				Path: vfsdBin,
 			},
 		})
 	}
@@ -201,6 +204,40 @@ func WithOS() DomainOption {
 	}
 }
 
+func WithDirectBoot(kernel, initrd, cmdline string) DomainOption {
+	return func(d *libvirtxml.Domain) {
+		d.OS.Kernel = kernel
+		d.OS.Initrd = initrd
+		d.OS.Cmdline = cmdline
+	}
+}
+
+func WithVNC(port int) DomainOption {
+	return func(d *libvirtxml.Domain) {
+		allocateDevices(d)
+		d.Devices.Graphics = append(d.Devices.Graphics, libvirtxml.DomainGraphic{
+			VNC: &libvirtxml.DomainGraphicVNC{
+				Port:   port,
+				Listen: "0.0.0.0",
+			},
+		})
+		d.Devices.Videos = append(d.Devices.Videos, libvirtxml.DomainVideo{
+			Model: libvirtxml.DomainVideoModel{
+				Type: "vga",
+			},
+		})
+	}
+}
+
+func WIthFeatures() DomainOption {
+	return func(d *libvirtxml.Domain) {
+		d.Features = &libvirtxml.DomainFeatureList{
+			ACPI: &libvirtxml.DomainFeature{},
+			APIC: &libvirtxml.DomainFeatureAPIC{},
+		}
+	}
+}
+
 type diskInfo struct {
 	Format      string `json:"format"`
 	BackingFile string `json:"backing-filename"`
@@ -224,7 +261,7 @@ func GetDiskInfo(imagePath string) (DiskDriverType, error) {
 	out, err := cmd.Output()
 	if err != nil {
 		errout, _ := io.ReadAll(stderr)
-		return "", fmt.Errorf("failed to invoke qemu-img: %v: %s", err, errout)
+		return "", fmt.Errorf("failed to invoke qemu-img on %s: %v: %s", imagePath, err, errout)
 	}
 	info := &diskInfo{}
 	err = json.Unmarshal(out, info)

@@ -5,7 +5,8 @@ Requires=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat VSOCK-LISTEN:1234,reuseaddr,fork UNIX-CONNECT:/var/run/podman/podman.sock
+ExecStart=/usr/local/bin/vsock-proxy --log-level debug --cid 3 --port 1234 \
+	--socket /var/run/podman/podman.sock --listen-mode vsockToUnix
 Restart=always
 RestartSec=3
 

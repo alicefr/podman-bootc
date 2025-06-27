@@ -13,7 +13,7 @@ all: out_dir docs
 
 .PHONY: proxy
 proxy: out_dir
-	go build -o $(output_dir)/$(binary_proxy) ./proxy
+	go build -o ${output_dir}/$(binary_proxy) ./proxy
 
 out_dir:
 	mkdir -p $(output_dir)
@@ -28,10 +28,9 @@ integration_tests:
 e2e_test: all
 	ginkgo -tags $(build_tags) ./test/...
 
-image:
+image: proxy
 	podman build -t $(vm_image) --device /dev/kvm \
-	-f containerfiles/vm/Containerfile \
-	containerfiles/vm
+	-f containerfiles/vm/Containerfile .
 
 .PHONY: docs
 docs:

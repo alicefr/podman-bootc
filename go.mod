@@ -10,6 +10,7 @@ require (
 	github.com/distribution/reference v0.5.0
 	github.com/docker/go-units v0.5.0
 	github.com/gofrs/flock v0.8.1
+	github.com/mdlayher/vsock v1.2.1
 	github.com/onsi/ginkgo/v2 v2.17.1
 	github.com/onsi/gomega v1.32.0
 	github.com/sirupsen/logrus v1.9.3
@@ -19,6 +20,8 @@ require (
 	golang.org/x/term v0.25.0
 	libvirt.org/go/libvirt v1.10002.0
 )
+
+require github.com/mdlayher/socket v0.4.1 // indirect
 
 require (
 	dario.cat/mergo v1.0.0 // indirect
@@ -59,7 +62,7 @@ require (
 	github.com/digitalocean/go-qemu v0.0.0-20230711162256-2e3d0186973e // indirect
 	github.com/disiqueira/gotree/v3 v3.0.2 // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
-	github.com/docker/docker v25.0.3+incompatible // indirect
+	github.com/docker/docker v25.0.3+incompatible
 	github.com/docker/docker-credential-helpers v0.8.1 // indirect
 	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -136,7 +139,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/opencontainers/runc v1.1.12 // indirect
 	github.com/opencontainers/runtime-spec v1.2.0
-	github.com/opencontainers/runtime-tools v0.9.1-0.20230914150019-408c51e934dc // indirect
+	github.com/opencontainers/runtime-tools v0.9.1-0.20230914150019-408c51e934dc
 	github.com/opencontainers/selinux v1.11.0 // indirect
 	github.com/openshift/imagebuilder v1.2.6 // indirect
 	github.com/ostreedev/ostree-go v0.0.0-20210805093236-719684c64e4f // indirect

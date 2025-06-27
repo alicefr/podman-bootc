@@ -7,24 +7,37 @@ import (
 	"net"
 	"os"
 
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
+	"github.com/mdlayher/vsock"
+	log "github.com/sirupsen/logrus"
 )
 
 type Proxy struct {
-	cid    uint
-	port   uint
+	cid    uint32
+	port   uint32
 	socket string
 	done   chan struct{}
+	start  func(socket string, port, cid uint32, done chan struct{}) error
 }
 
-func NewProxy(cid, port uint, socket string) *Proxy {
-	return &Proxy{
+func NewProxyUnixSocketToVsock(port, cid uint32, socket string) *Proxy {
+	p := &Proxy{
 		cid:    cid,
 		port:   port,
 		socket: socket,
 		done:   make(chan struct{}),
+		start:  startUnixToVsock,
 	}
+	return p
+}
+
+func NewProxyVSockToUnixSocket(port uint32, socket string) *Proxy {
+	p := &Proxy{
+		port:   port,
+		socket: socket,
+		done:   make(chan struct{}),
+		start:  startVsockToUnix,
+	}
+	return p
 }
 
 func (proxy *Proxy) GetSocket() string {
@@ -39,13 +52,17 @@ func (proxy *Proxy) Stop() {
 		close(proxy.done)
 	}
 	os.Remove(proxy.socket)
-	logrus.Debugf("Stopped proxy")
+	log.Debugf("Stopped proxy")
 }
 
-func (proxy *Proxy) Start() error {
-	_ = os.Remove(proxy.socket)
+func (p *Proxy) Start() error {
+	return p.start(p.socket, p.port, p.cid, p.done)
+}
 
-	unixListener, err := net.Listen("unix", proxy.socket)
+func startUnixToVsock(socket string, port, cid uint32, done chan struct{}) error {
+	_ = os.Remove(socket)
+
+	unixListener, err := net.Listen("unix", socket)
 	if err != nil {
 		return fmt.Errorf("Failed to listen on unix socket: %v", err)
 	}
@@ -54,85 +71,115 @@ func (proxy *Proxy) Start() error {
 
 		for {
 			select {
-			case <-proxy.done:
+			case <-done:
 				return
 			default:
 				unixConn, err := unixListener.Accept()
 				if err != nil {
-					logrus.Warnf("Accept error: %v", err)
+					log.Warnf("Accept error: %v", err)
 					continue
 				}
+				log.Debugf("Accepted connection from %s to port %d and cid", socket, port, cid)
 
-				go proxy.handleConnection(unixConn)
+				go handleConnectionToVsock(unixConn, port, cid, done)
 			}
 		}
 	}()
 
-	logrus.Debugf("Started proxy at: %s", proxy.socket)
+	log.Debugf("Started proxy at: %s", socket)
 
 	return nil
 }
 
-func (proxy *Proxy) handleConnection(unixConn net.Conn) {
+func handleConnectionToVsock(unixConn net.Conn, port, cid uint32, done chan struct{}) {
 	defer unixConn.Close()
-
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	vsockConn, err := vsock.Dial(cid, port, nil)
 	if err != nil {
-		logrus.Errorf("vsock socket error: %v", err)
+		log.Printf("vsock connect error (cid: %d, port: %d): %v", cid, port, err)
 		return
 	}
-
-	sa := &unix.SockaddrVM{CID: uint32(proxy.cid), Port: uint32(proxy.port)}
-	if err := unix.Connect(fd, sa); err != nil {
-		logrus.Debugf("Failed to connect error: %v", err)
-		return
-	}
-
-	vconnFile := os.NewFile(uintptr(fd), "vsock")
-	if vconnFile == nil {
-		logrus.Error("Failed to create os.File from fd")
-		unix.Close(fd)
-		return
-	}
-	defer vconnFile.Close()
+	defer vsockConn.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	errCh := make(chan error, 2)
-	go proxy.proxyFileToConn(ctx, vconnFile, unixConn, errCh)
-	go proxy.proxyConnToFile(ctx, unixConn, vconnFile, errCh)
+	go proxy(ctx, vsockConn, unixConn, errCh, done)
+	go proxy(ctx, unixConn, vsockConn, errCh, done)
 
 	// Wait for the first error or cancellation
 	select {
-	case <-proxy.done:
+	case <-done:
 	case err := <-errCh:
 		if err != nil && err != io.EOF {
-			logrus.Errorf("proxy error: %v", err)
+			log.Errorf("proxy error: %v", err)
 		}
 	}
 }
 
-func (proxy *Proxy) proxyFileToConn(ctx context.Context, file *os.File, conn net.Conn, errCh chan error) {
+func proxy(ctx context.Context, src, dst net.Conn, errCh chan error, done chan struct{}) {
 	go func() {
-		_, err := io.Copy(conn, file)
+		_, err := io.Copy(dst, src)
 		errCh <- err
 	}()
 	select {
 	case <-ctx.Done():
-	case <-proxy.done:
+	case <-done:
 	case <-errCh:
 	}
 }
 
-func (proxy *Proxy) proxyConnToFile(ctx context.Context, conn net.Conn, file *os.File, errCh chan error) {
+func startVsockToUnix(socket string, port, cid uint32, done chan struct{}) error {
+	vsockListener, err := vsock.Listen(port, &vsock.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to listen on vsock port %d: %v", port, err)
+	}
 	go func() {
-		_, err := io.Copy(file, conn)
-		errCh <- err
+		defer vsockListener.Close()
+
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				vsockConn, err := vsockListener.Accept()
+				if err != nil {
+					log.Warnf("Accept error: %v", err)
+					continue
+				}
+				log.Debugf("Accepted connection from port %d to socket %d", port, socket)
+
+				go handleConnectionToUnix(vsockConn, socket, port, done)
+			}
+		}
 	}()
+
+	log.Debugf("Started proxy at port: %d", port)
+
+	return nil
+}
+
+func handleConnectionToUnix(vsockConn net.Conn, socket string, port uint32, done chan struct{}) {
+	defer vsockConn.Close()
+
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		log.Errorf("failed to connect: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	go proxy(ctx, conn, vsockConn, errCh, done)
+	go proxy(ctx, vsockConn, conn, errCh, done)
+
+	// Wait for the first error or cancellation
 	select {
-	case <-ctx.Done():
-	case <-proxy.done:
-	case <-errCh:
+	case <-done:
+	case err := <-errCh:
+		if err != nil && err != io.EOF {
+			log.Errorf("proxy error: %v", err)
+		}
 	}
 }

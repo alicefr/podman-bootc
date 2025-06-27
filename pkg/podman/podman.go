@@ -1,32 +1,254 @@
 package podman
 
 import (
-	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
 
+	_ "embed"
+
 	"github.com/containers/podman-bootc/pkg/utils"
+	"github.com/containers/podman-bootc/pkg/vm"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/bindings/images"
 	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/docker/docker/api/types"
 )
 
-func createContainer(ctx context.Context, vmImage string) (string, error) {
+type RunVMContainerOptions struct {
+	ContainerStoragePath string
+	ConfigDir            string
+	OutputDir            string
+	SocketDir            string
+	LibvirtSocketDir     string
+}
+
+func detectLocalPodman() string {
+	return ""
+}
+
+type VMContainer struct {
+	contID     string
+	image      string
+	socketPath string
+	opts       *RunVMContainerOptions
+}
+
+func ExecInContainer(ctx context.Context, containerID string, cmd []string) (string, error) {
+	execCreateOptions := &handlers.ExecCreateConfig{
+		ExecConfig: types.ExecConfig{
+			Tty:          true,
+			AttachStdin:  true,
+			AttachStderr: true,
+			AttachStdout: true,
+			Cmd:          cmd,
+		},
+	}
+	execID, err := containers.ExecCreate(ctx, containerID, execCreateOptions)
+	if err != nil {
+		return "", fmt.Errorf("exec create failed: %w", err)
+	}
+	// Prepare streams
+	var stdoutBuf, stderrBuf bytes.Buffer
+	var stdout io.Writer = &stdoutBuf
+	var stderr io.Writer = &stderrBuf
+	// Start exec and attach
+	err = containers.ExecStartAndAttach(ctx, execID, &containers.ExecStartAndAttachOptions{
+		OutputStream: &stdout,
+		ErrorStream:  &stderr,
+		AttachOutput: utils.Ptr(true),
+		AttachError: utils.Ptr(true),
+	})
+	if err != nil {
+		return "", fmt.Errorf("exec start failed: %w", err)
+	}
+
+	// Handle output and errors
+	if stderrBuf.Len() > 0 {
+		return "", fmt.Errorf("stderr: %s", stderrBuf.String())
+	}
+
+	return stdoutBuf.String(), nil
+}
+
+func (c *VMContainer) GetBootArtifacts() (string, string, error) {
+	ctx, err := connectPodman(c.socketPath)
+	if err != nil {
+		return "", "", fmt.Errorf("Failed to connect to Podman service: %v", err)
+	}
+	isRunning, err := isContainerRunning(ctx, c.contID)
+	if err != nil {
+		return "", "", err
+	}
+	if !isRunning {
+		return "", "", fmt.Errorf("the VM container isn't running")
+	}
+	findKernel := []string{"find", "/bootc-data/usr/lib/modules/", "-name", "vmlinuz", "-type", "f"}
+	findInitrd := []string{"find", "/bootc-data/usr/lib/modules/", "-name", "initramfs.img", "-type", "f"}
+	out, err := ExecInContainer(ctx, c.contID, findKernel)
+	if err != nil {
+		return "", "", err
+	}
+	kernel := strings.Trim(out, "\r\n")
+	out, err = ExecInContainer(ctx, c.contID, findInitrd)
+	if err != nil {
+		return "", "", err
+	}
+	initrd := strings.Trim(out, "\r\n")
+
+	return kernel, initrd, nil
+}
+
+func NewVMContainer(image, socketPath string, opts *RunVMContainerOptions) *VMContainer {
+	return &VMContainer{
+		image:      image,
+		socketPath: socketPath,
+		opts:       opts,
+	}
+}
+
+func (c *VMContainer) Stop() error {
+	ctx, err := connectPodman(c.socketPath)
+	if err != nil {
+		return fmt.Errorf("Failed to connect to Podman service: %v", err)
+	}
+	if err := containers.Stop(ctx, c.contID, &containers.StopOptions{}); err != nil {
+		return fmt.Errorf("failed to stop the bootc container: %v", err)
+	}
+	if _, err := containers.Remove(ctx, c.contID, &containers.RemoveOptions{}); err != nil {
+		return fmt.Errorf("failed to stop the bootc container: %v", err)
+	}
+
+	return nil
+}
+
+func (c *VMContainer) Run() error {
+	ctx, err := connectPodman(c.socketPath)
+	if err != nil {
+		return fmt.Errorf("Failed to connect to Podman service: %v", err)
+	}
+
+	c.contID, err = createVMContainer(ctx, c.image, c.opts)
+	if err != nil {
+		return err
+	}
+
+	if err := containers.Start(ctx, c.contID, &containers.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start the bootc container: %v", err)
+	}
+
+	isRunning, err := isContainerRunning(ctx, c.contID)
+	if err != nil {
+		return err
+	}
+	if !isRunning {
+		return fmt.Errorf("the VM container %s isn't running", c.contID)
+	}
+	return err
+}
+
+func isContainerRunning(ctx context.Context, name string) (bool, error) {
+	inspectData, err := containers.Inspect(ctx, name, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	// Check if it's running
+	return inspectData.State.Running, nil
+}
+
+func pullImage(ctx context.Context, image string) error {
+	if _, err := images.Pull(ctx, image, &images.PullOptions{}); err != nil {
+		return fmt.Errorf("failed to pull image %s: %w", image, err)
+	}
+
+	return nil
+}
+
+func createVMContainer(ctx context.Context, image string, opts *RunVMContainerOptions) (string, error) {
+	if err := pullImage(ctx, image); err != nil {
+		return "", err
+	}
 	specGen := &specgen.SpecGenerator{
 		ContainerBasicConfig: specgen.ContainerBasicConfig{
-			Command: []string{"/"},
+			Command: []string{"/entrypoint.sh"},
+			Stdin:   utils.Ptr(true),
 		},
 		ContainerStorageConfig: specgen.ContainerStorageConfig{
-			Image: vmImage,
+			Image: vm.VMImage,
+			ImageVolumes: []*specgen.ImageVolume{
+				{
+					Destination: vm.BootcDir,
+					Source:      image,
+					ReadWrite:   true,
+				},
+			},
+			Devices: []ocispec.LinuxDevice{
+				{
+					Path: "/dev/kvm",
+					Type: "char",
+				},
+				{
+					Path: "/dev/vhost-net",
+					Type: "char",
+				},
+				{
+					Path: "/dev/vhost-vsock",
+					Type: "char",
+				},
+				{
+					Path: "/dev/vhost-vsock",
+					Type: "char",
+				},
+			},
+			Mounts: []ocispec.Mount{
+				{
+					Destination: vm.ContainerStoragePath,
+					Source:      opts.ContainerStoragePath,
+					Type:        "bind",
+				},
+				{
+					Destination: vm.OutputDir,
+					Source:      opts.OutputDir,
+					Type:        "bind",
+				},
+				{
+					Destination: vm.ConfigDir,
+					Source:      opts.ConfigDir,
+					Type:        "bind",
+				},
+				{
+					Destination: vm.SocketDir,
+					Source:      opts.SocketDir,
+					Type:        "bind",
+				},
+				{
+					Destination: vm.LibvirtSocketDir,
+					Source:      opts.LibvirtSocketDir,
+					Type:        "bind",
+				},
+			},
+		},
+		ContainerSecurityConfig: specgen.ContainerSecurityConfig{
+			Privileged:  utils.Ptr(true),
+			SelinuxOpts: []string{"type:unconfined_t"},
+		},
+		ContainerCgroupConfig: specgen.ContainerCgroupConfig{},
+		ContainerNetworkConfig: specgen.ContainerNetworkConfig{
+			PublishExposedPorts: utils.Ptr(true),
+			Expose: map[uint16]string{uint16(vm.VNCPort): "tcp"},
 		},
 	}
 	if err := specGen.Validate(); err != nil {
@@ -37,77 +259,9 @@ func createContainer(ctx context.Context, vmImage string) (string, error) {
 		return "", err
 	}
 
+	log.Debugf("Run VM container ID: %s", response.ID)
+
 	return response.ID, nil
-}
-
-func extractTar(reader io.Reader, dest string) error {
-	tr := tar.NewReader(reader)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		target := filepath.Join(dest, header.Name)
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return err
-			}
-			outFile, err := os.Create(target)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(outFile, tr); err != nil {
-				outFile.Close()
-				return err
-			}
-			outFile.Close()
-		}
-	}
-
-	return nil
-}
-
-func ExtractDiskImage(socketPath, dir, vmImage string) error {
-	if err := os.Mkdir(dir, 0750); err != nil && !os.IsExist(err) {
-		return err
-	}
-	ctx, err := bindings.NewConnection(context.Background(), fmt.Sprintf("unix:%s", socketPath))
-	if err != nil {
-		return err
-	}
-
-	containerName, err := createContainer(ctx, vmImage)
-	if err != nil {
-		return err
-	}
-
-	pr, pw := io.Pipe()
-
-	go func() {
-		defer pw.Close()
-		err := containers.Export(ctx, containerName, pw, &containers.ExportOptions{})
-		if err != nil {
-			// If an error occurs, propagate it to the pipe reader
-			pw.CloseWithError(err)
-		}
-	}()
-	if err := extractTar(pr, dir); err != nil {
-		return err
-	}
-	log.Debugf("Extracted disk at: %s", dir)
-
-	return nil
 }
 
 func connectPodman(socketPath string) (context.Context, error) {
