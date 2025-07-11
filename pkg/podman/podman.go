@@ -33,6 +33,7 @@ type RunVMContainerOptions struct {
 	OutputDir            string
 	SocketDir            string
 	LibvirtSocketDir     string
+	Keep                 bool
 }
 
 func detectLocalPodman() string {
@@ -120,6 +121,10 @@ func NewVMContainer(image, socketPath string, opts *RunVMContainerOptions) *VMCo
 }
 
 func (c *VMContainer) Stop() error {
+	if c.opts.Keep {
+		log.Debugf("keep flag is set, not stopping vm container %s", c.contID)
+		return nil
+	}
 	ctx, err := connectPodman(c.socketPath)
 	if err != nil {
 		return fmt.Errorf("Failed to connect to Podman service: %v", err)
@@ -128,7 +133,7 @@ func (c *VMContainer) Stop() error {
 		return fmt.Errorf("failed to stop the bootc container: %v", err)
 	}
 	if _, err := containers.Remove(ctx, c.contID, &containers.RemoveOptions{}); err != nil {
-		return fmt.Errorf("failed to stop the bootc container: %v", err)
+		return fmt.Errorf("failed to remove the bootc container: %v", err)
 	}
 
 	return nil
@@ -202,10 +207,6 @@ func createVMContainer(ctx context.Context, image string, opts *RunVMContainerOp
 				},
 				{
 					Path: "/dev/vhost-net",
-					Type: "char",
-				},
-				{
-					Path: "/dev/vhost-vsock",
 					Type: "char",
 				},
 				{

@@ -10,8 +10,8 @@ import (
 	"github.com/containers/podman-bootc/pkg/vm"
 	"github.com/containers/podman-bootc/pkg/vm/domain"
 	"github.com/containers/podman/v5/pkg/bindings"
-	"github.com/spf13/cobra"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 type installCmd struct {
@@ -28,6 +28,7 @@ type installCmd struct {
 	configPath       string
 	outputPath       string
 	installVM        *vm.InstallVM
+	keepRunning      bool
 }
 
 func filterCmdlineArgs(args []string) ([]string, error) {
@@ -65,6 +66,7 @@ func NewInstallCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&c.configPath, "config-dir", "", "path where to find the config.toml")
 	cmd.PersistentFlags().StringVar(&c.containerStorage, "container-storage", podman.DefaultContainerStorage(), "Container storage to use")
 	cmd.PersistentFlags().StringVar(&c.socket, "podman-socket", podman.DefaultPodmanSocket(), "path to the podman socket")
+	cmd.PersistentFlags().BoolVarP(&c.keepRunning, "keep", "", false, "should keep the VM container running, manual clean-up is required")
 	if args, err := filterCmdlineArgs(os.Args); err == nil {
 		c.bootcCmdLine = args
 	}
@@ -110,7 +112,7 @@ func (c *installCmd) validateArgs() error {
 	return nil
 }
 
-func (c *installCmd) installBuildVM(kernel, initrd string) error {
+func (c *installCmd) installBuildVM(kernel, initrd string, keep bool) error {
 	image := filepath.Join(c.outputPath, c.outputImage)
 	outputImageFormat, err := domain.GetDiskInfo(image)
 	if err != nil {
@@ -122,7 +124,7 @@ func (c *installCmd) installBuildVM(kernel, initrd string) error {
 		Root:         false,
 		Kernel:       kernel,
 		Initrd:       initrd,
-	})
+	}, keep)
 	if err := c.installVM.Run(); err != nil {
 		return err
 	}
@@ -153,6 +155,7 @@ func (c *installCmd) doInstall(_ *cobra.Command, _ []string) error {
 		OutputDir:            c.outputPath,
 		SocketDir:            c.podmanSocketDir,
 		LibvirtSocketDir:     c.libvirtDir,
+		Keep:                 c.keepRunning,
 	})
 	if err := vmCont.Run(); err != nil {
 		return err
@@ -165,7 +168,7 @@ func (c *installCmd) doInstall(_ *cobra.Command, _ []string) error {
 	}
 	log.Debugf("Boot artifacts kernel: %s and initrd: %s", kernel, initrd)
 
-	if err := c.installBuildVM(kernel, initrd); err != nil {
+	if err := c.installBuildVM(kernel, initrd, c.keepRunning); err != nil {
 		return err
 	}
 	defer c.installVM.Stop()

@@ -23,6 +23,4 @@ COPY containerfiles/vm/virtiofsd-wrapper /usr/local/bin/virtiofsd-wrapper
 
 EXPOSE 5959
 
-RUN dnf install -y socat
-
 ENTRYPOINT ["/entrypoint.sh"]

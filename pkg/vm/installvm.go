@@ -45,6 +45,7 @@ const (
 const cmdline = "console=ttyS0 rootfstype=virtiofs root=root rw init=/sbin/init panic=1"
 
 const VNCPort int = 5959
+
 // The virtiofs wrapper helps to launch virtiofs with the correct flags inside a container
 const VsfdWrapperPath = "/usr/local/bin/virtiofsd-wrapper"
 
@@ -61,6 +62,7 @@ type InstallVM struct {
 	socket     string
 	domain     string
 	opts       InstallOptions
+	keep       bool
 }
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOQRSTUVWXYZ0123456789"
@@ -73,7 +75,7 @@ func RandomString(n int) string {
 	return string(b)
 }
 
-func NewInstallVM(path string, opts InstallOptions) *InstallVM {
+func NewInstallVM(path string, opts InstallOptions, keep bool) *InstallVM {
 	mode := "session"
 	if opts.Root {
 		mode = "system"
@@ -85,6 +87,7 @@ func NewInstallVM(path string, opts InstallOptions) *InstallVM {
 		libvirtURI: uri,
 		opts:       opts,
 		socket:     path,
+		keep:       keep,
 	}
 }
 
@@ -166,6 +169,9 @@ func (vm *InstallVM) Run() error {
 }
 
 func (vm *InstallVM) Stop() error {
+	if vm.keep {
+		return nil
+	}
 	conn, err := libvirt.NewConnect(vm.libvirtURI)
 	if err != nil {
 		return err
