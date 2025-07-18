@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"math/rand"
@@ -19,6 +20,30 @@ const (
 	CIDInstallVM = 3
 	VSOCKPort    = 1234
 )
+
+var (
+	domainEventCallbacks = make(map[string]chan struct{})
+	callbackMutex        = &sync.Mutex{}
+)
+
+func DomainEventCallback(_ *libvirt.Connect, d *libvirt.Domain, event *libvirt.DomainEventLifecycle) {
+	name, err := d.GetName()
+	if err != nil {
+		logrus.Errorf("failed to get domain name in callback: %v", err)
+		return
+	}
+	logrus.Debugf("Domain event for '%s', event type: %d, detail: %d", name, event.Event, event.Detail)
+
+	callbackMutex.Lock()
+	defer callbackMutex.Unlock()
+
+	if event.Event == libvirt.DOMAIN_EVENT_STOPPED || event.Event == libvirt.DOMAIN_EVENT_SHUTDOWN {
+		if ch, ok := domainEventCallbacks[name]; ok {
+			close(ch)
+			delete(domainEventCallbacks, name)
+		}
+	}
+}
 
 const VMImage = "quay.io/containers/bootc-vm:latest"
 
@@ -52,14 +77,12 @@ const VsfdWrapperPath = "/usr/local/bin/virtiofsd-wrapper"
 type InstallOptions struct {
 	OutputImage  string
 	OutputFormat domain.DiskDriverType
-	Root         bool
 	Kernel       string
 	Initrd       string
 }
 
 type InstallVM struct {
 	libvirtURI string
-	socket     string
 	domain     string
 	opts       InstallOptions
 	keep       bool
@@ -75,19 +98,13 @@ func RandomString(n int) string {
 	return string(b)
 }
 
-func NewInstallVM(path string, opts InstallOptions, keep bool) *InstallVM {
-	mode := "session"
-	if opts.Root {
-		mode = "system"
-	}
-	uri := fmt.Sprintf("qemu:///%s?socket=%s", mode, path)
+func NewInstallVM(opts InstallOptions) *InstallVM {
+	uri := "qemu:///session"
 	name := "bootc-" + RandomString(5)
 	return &InstallVM{
 		domain:     name,
 		libvirtURI: uri,
 		opts:       opts,
-		socket:     path,
-		keep:       keep,
 	}
 }
 
@@ -107,7 +124,6 @@ func (vm *InstallVM) newDomain() *libvirtxml.Domain {
 		domain.WithDisk(filepath.Join(OutputDir, vm.opts.OutputImage), "output", "vda", vm.opts.OutputFormat, domain.DiskBusVirtio),
 		domain.WithFilesystem(BootcDir, RootTarget, VsfdWrapperPath),
 		domain.WithFilesystem(ContainerStoragePath, StorageVirtiofsTarget, VsfdWrapperPath),
-		domain.WithFilesystem(ConfigDir, ConfigVirtiofsTarget, VsfdWrapperPath),
 		domain.WithFilesystem(OutputDir, OutputVirtiofsTarget, VsfdWrapperPath),
 		domain.WithDirectBoot(vm.opts.Kernel, vm.opts.Initrd, cmdline),
 		domain.WithVNC(VNCPort),
@@ -138,9 +154,6 @@ func waitForSocket(path string, timeout time.Duration, interval time.Duration) e
 }
 
 func (vm *InstallVM) Run() error {
-	if err := waitForSocket(vm.socket, 2*time.Minute, 1*time.Second); err != nil {
-		return err
-	}
 	domainXML, err := vm.newDomain().Marshal()
 	if err != nil {
 		return err
@@ -189,5 +202,43 @@ func (vm *InstallVM) Stop() error {
 	}
 	logrus.Debugf("Domain %s stopped and deleted successfully", vm.domain)
 
+	return nil
+}
+
+func (vm *InstallVM) Wait() error {
+	conn, err := libvirt.NewConnect(vm.libvirtURI)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	done := make(chan struct{})
+	callbackMutex.Lock()
+	domainEventCallbacks[vm.domain] = done
+	callbackMutex.Unlock()
+
+	defer func() {
+		callbackMutex.Lock()
+		delete(domainEventCallbacks, vm.domain)
+		callbackMutex.Unlock()
+	}()
+
+	dom, err := conn.LookupDomainByName(vm.domain)
+	if err != nil {
+		return fmt.Errorf("failed to lookup domain %s: %w", vm.domain, err)
+	}
+	defer dom.Free()
+
+	state, _, err := dom.GetState()
+	if err != nil {
+		return fmt.Errorf("failed to get domain state for %s: %w", vm.domain, err)
+	}
+	if state == libvirt.DOMAIN_SHUTOFF || state == libvirt.DOMAIN_CRASHED {
+		return fmt.Errorf("domain %s is already stopped", vm.domain)
+	}
+	logrus.Debugf("Waiting for domain %s to stop", vm.domain)
+
+	<-done
+	logrus.Infof("Domain %s stopped.", vm.domain)
 	return nil
 }

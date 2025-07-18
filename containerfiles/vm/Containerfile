@@ -5,6 +5,7 @@ RUN dnf install -y \
 	libvirt-daemon \
 	libvirt-daemon-driver-qemu \
 	libvirt-daemon-driver-storage-core \
+	procps-ng \
 	qemu-kvm \
 	socat \
 	virt-install \
@@ -20,7 +21,8 @@ COPY containerfiles/vm/files /vm_files
 COPY containerfiles/vm/qemu.conf /etc/libvirt/qemu.conf
 COPY containerfiles/vm/virtqemud.conf /etc/libvirt/virtqemud.conf
 COPY containerfiles/vm/virtiofsd-wrapper /usr/local/bin/virtiofsd-wrapper
+COPY bin/entrypoint /entrypoint
 
 EXPOSE 5959
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint"]

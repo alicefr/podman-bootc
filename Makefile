@@ -1,5 +1,6 @@
 binary_name = podman-bootc
 binary_proxy= vsock-proxy
+binary_entrypoint= entrypoint
 output_dir = bin
 build_tags = exclude_graphdriver_btrfs,btrfs_noversion,exclude_graphdriver_devicemapper,containers_image_openpgp,remote
 
@@ -15,6 +16,9 @@ all: out_dir docs
 proxy: out_dir
 	go build -o ${output_dir}/$(binary_proxy) ./proxy
 
+entrypoint: out_dir
+	go build -o $(output_dir)/$(binary_entrypoint) cmd/entrypoint/main.go
+
 out_dir:
 	mkdir -p $(output_dir)
 
@@ -28,7 +32,7 @@ integration_tests:
 e2e_test: all
 	ginkgo -tags $(build_tags) ./test/...
 
-image: proxy
+image: proxy entrypoint
 	podman build -t $(vm_image) --device /dev/kvm \
 	-f containerfiles/vm/Containerfile .
 

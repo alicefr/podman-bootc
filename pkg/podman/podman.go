@@ -1,14 +1,11 @@
 package podman
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/user"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "embed"
@@ -19,21 +16,15 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/containers/podman/v5/libpod/define"
-	"github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
-	"github.com/containers/podman/v5/pkg/bindings/images"
 	"github.com/containers/podman/v5/pkg/specgen"
-	"github.com/docker/docker/api/types"
 )
 
 type RunVMContainerOptions struct {
 	ContainerStoragePath string
-	ConfigDir            string
 	OutputDir            string
-	SocketDir            string
-	LibvirtSocketDir     string
-	Keep                 bool
+	Command              []string
 }
 
 func detectLocalPodman() string {
@@ -47,71 +38,6 @@ type VMContainer struct {
 	opts       *RunVMContainerOptions
 }
 
-func ExecInContainer(ctx context.Context, containerID string, cmd []string) (string, error) {
-	execCreateOptions := &handlers.ExecCreateConfig{
-		ExecConfig: types.ExecConfig{
-			Tty:          true,
-			AttachStdin:  true,
-			AttachStderr: true,
-			AttachStdout: true,
-			Cmd:          cmd,
-		},
-	}
-	execID, err := containers.ExecCreate(ctx, containerID, execCreateOptions)
-	if err != nil {
-		return "", fmt.Errorf("exec create failed: %w", err)
-	}
-	// Prepare streams
-	var stdoutBuf, stderrBuf bytes.Buffer
-	var stdout io.Writer = &stdoutBuf
-	var stderr io.Writer = &stderrBuf
-	// Start exec and attach
-	err = containers.ExecStartAndAttach(ctx, execID, &containers.ExecStartAndAttachOptions{
-		OutputStream: &stdout,
-		ErrorStream:  &stderr,
-		AttachOutput: utils.Ptr(true),
-		AttachError:  utils.Ptr(true),
-	})
-	if err != nil {
-		return "", fmt.Errorf("exec start failed: %w", err)
-	}
-
-	// Handle output and errors
-	if stderrBuf.Len() > 0 {
-		return "", fmt.Errorf("stderr: %s", stderrBuf.String())
-	}
-
-	return stdoutBuf.String(), nil
-}
-
-func (c *VMContainer) GetBootArtifacts() (string, string, error) {
-	ctx, err := connectPodman(c.socketPath)
-	if err != nil {
-		return "", "", fmt.Errorf("Failed to connect to Podman service: %v", err)
-	}
-	isRunning, err := isContainerRunning(ctx, c.contID)
-	if err != nil {
-		return "", "", err
-	}
-	if !isRunning {
-		return "", "", fmt.Errorf("the VM container isn't running")
-	}
-	findKernel := []string{"find", "/bootc-data/usr/lib/modules/", "-name", "vmlinuz", "-type", "f"}
-	findInitrd := []string{"find", "/bootc-data/usr/lib/modules/", "-name", "initramfs.img", "-type", "f"}
-	out, err := ExecInContainer(ctx, c.contID, findKernel)
-	if err != nil {
-		return "", "", err
-	}
-	kernel := strings.Trim(out, "\r\n")
-	out, err = ExecInContainer(ctx, c.contID, findInitrd)
-	if err != nil {
-		return "", "", err
-	}
-	initrd := strings.Trim(out, "\r\n")
-
-	return kernel, initrd, nil
-}
-
 func NewVMContainer(image, socketPath string, opts *RunVMContainerOptions) *VMContainer {
 	return &VMContainer{
 		image:      image,
@@ -121,10 +47,6 @@ func NewVMContainer(image, socketPath string, opts *RunVMContainerOptions) *VMCo
 }
 
 func (c *VMContainer) Stop() error {
-	if c.opts.Keep {
-		log.Debugf("keep flag is set, not stopping vm container %s", c.contID)
-		return nil
-	}
 	ctx, err := connectPodman(c.socketPath)
 	if err != nil {
 		return fmt.Errorf("Failed to connect to Podman service: %v", err)
@@ -164,6 +86,14 @@ func (c *VMContainer) Run() error {
 	return err
 }
 
+func (c *VMContainer) Wait() error {
+	ctx, err := connectPodman(c.socketPath)
+	if err != nil {
+		return fmt.Errorf("Failed to connect to Podman service: %v", err)
+	}
+	return fetchLogsAfterExit(ctx, c.contID)
+}
+
 func isContainerRunning(ctx context.Context, name string) (bool, error) {
 	inspectData, err := containers.Inspect(ctx, name, nil)
 	if err != nil {
@@ -174,21 +104,14 @@ func isContainerRunning(ctx context.Context, name string) (bool, error) {
 	return inspectData.State.Running, nil
 }
 
-func pullImage(ctx context.Context, image string) error {
-	if _, err := images.Pull(ctx, image, &images.PullOptions{}); err != nil {
-		return fmt.Errorf("failed to pull image %s: %w", image, err)
-	}
-
-	return nil
-}
-
 func createVMContainer(ctx context.Context, image string, opts *RunVMContainerOptions) (string, error) {
-	if err := pullImage(ctx, image); err != nil {
-		return "", err
+	cmd := opts.Command
+	if len(cmd) == 0 {
+		cmd = []string{"/entrypoint.sh"}
 	}
 	specGen := &specgen.SpecGenerator{
 		ContainerBasicConfig: specgen.ContainerBasicConfig{
-			Command: []string{"/entrypoint.sh"},
+			Command: cmd,
 			Stdin:   utils.Ptr(true),
 		},
 		ContainerStorageConfig: specgen.ContainerStorageConfig{
@@ -223,21 +146,6 @@ func createVMContainer(ctx context.Context, image string, opts *RunVMContainerOp
 				{
 					Destination: vm.OutputDir,
 					Source:      opts.OutputDir,
-					Type:        "bind",
-				},
-				{
-					Destination: vm.ConfigDir,
-					Source:      opts.ConfigDir,
-					Type:        "bind",
-				},
-				{
-					Destination: vm.SocketDir,
-					Source:      opts.SocketDir,
-					Type:        "bind",
-				},
-				{
-					Destination: vm.LibvirtSocketDir,
-					Source:      opts.LibvirtSocketDir,
 					Type:        "bind",
 				},
 			},
@@ -321,11 +229,6 @@ func createBootcContainer(ctx context.Context, image string, bootcCmdLine []stri
 				{
 					Destination: "/output",
 					Source:      vm.OutputDir,
-					Type:        "bind",
-				},
-				{
-					Destination: "/config",
-					Source:      vm.ConfigDir,
 					Type:        "bind",
 				},
 			},
